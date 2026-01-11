@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "nitro.build": {
+      "type": "http",
+      "url": "https://gitmcp.io/nitrojs/nitro"
+    },
+    "grammyjs": {
+      "type": "http",
+      "url": "https://gitmcp.io/grammyjs/grammY"
+    }
+  }
+}
