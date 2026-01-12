@@ -17,7 +17,7 @@ export class ItemGenerator {
    * Generates 10 items and returns up to 4 that are new (not in DB).
    */
   async generate(parentName: string) {
-    const result = await this.ai.run("@cf/meta/llama-3.3-70b-instruct-fp8-fast", {
+    const result = await this.ai.run("@cf/meta/llama-3.1-8b-instruct-fast", {
       messages: [
         {
           role: "system",
