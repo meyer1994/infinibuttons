@@ -132,10 +132,21 @@ export class TelegramBot {
     this.bot.on(':text', async ctx => await ctx.reply(`echo: ${ctx.message?.text}`));
   }
 
+  private async dynamicFetchChildren(ctx: MyContext) {
+    try {
+      await ctx.replyWithChatAction('typing');
+      return await this.fetchChildren(ctx.session.currentElementId);
+    } catch (error) {
+      console.error(`TelegramBot: Error fetching children for id ${ctx.session.currentElementId}: ${error}`);
+      await ctx.react('🤬');
+      throw error;
+    }
+  }
+
   private setupMenus() {
     const menuDiscoveryA = new Menu<MyContext>('discovery-a')
       .dynamic(async (ctx, range) => {
-        const children = await this.fetchChildren(ctx.session.currentElementId);
+        const children = await this.dynamicFetchChildren(ctx);
 
         let i = 0;
         for (const child of children) {
@@ -154,7 +165,7 @@ export class TelegramBot {
 
     const menuDiscoveryB = new Menu<MyContext>('discovery-b')
       .dynamic(async (ctx, range) => {
-        const children = await this.fetchChildren(ctx.session.currentElementId);
+        const children = await this.dynamicFetchChildren(ctx);
 
         let i = 0;
         for (const child of children) {

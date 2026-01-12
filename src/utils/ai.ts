@@ -22,11 +22,21 @@ export class ItemGenerator {
       messages: [
         {
           role: "system",
-          content: "You are a creative assistant that generates items for a discovery game. Each item needs a name and an emoji."
+          content: `
+            You generate similar words based on the given word.
+
+            - You may generate complex words, but prefer single words. Examples: 
+              - country of france
+              - japan's capital
+              - someones's dog
+              - big ball
+            - The words must be similar to the parent word.
+            - You must generate a word and an emoji that is related to the word.
+          `
         },
         {
           role: "user",
-          content: `Generate 10 items that can be derived from or are related to "${parentName}".`
+          content: `Here is the word: ${parentName}`
         }
       ],
       response_format: {
