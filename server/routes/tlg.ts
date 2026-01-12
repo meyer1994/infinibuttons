@@ -1,5 +1,5 @@
-import { webhookCallback } from 'grammy';
 import { Update } from 'grammy/types';
+import { webhookCallback } from 'grammy/web';
 import { eventHandler, type H3Event } from 'h3';
 
 /**
@@ -58,28 +58,20 @@ const nitroModule: NitroModuleAdapter = (event) => {
     respond: async (json: string) => {
       setResponseStatus(event, 200);
       setHeader(event, 'Content-Type', 'application/json');
-      await sendStream(event, new ReadableStream({
-        start(controller) {
-          controller.enqueue(json);
-          controller.close();
-        },
-      }));
+      const blob = new Blob([json], { type: 'application/json' });
+      await sendStream(event, blob.stream());
     },
 
     unauthorized: async () => {
       setResponseStatus(event, 401);
       setResponseHeader(event, 'Content-Type', 'application/json');
-      await sendStream(event, new ReadableStream({
-        start(controller) {
-          controller.enqueue('secret token is wrong');
-          controller.close();
-        },
-      }));
+      const blob = new Blob(['secret token is wrong'], { type: 'application/json' });
+      await sendStream(event, blob.stream());
     },
   };
 };
 
 // Learn more: https://nitro.build/guide/routing
 export default eventHandler(async (event) => {
-  return await webhookCallback(event.context.bot, nitroModule)(event);
+  return await webhookCallback(event.context.bot.bot, nitroModule)(event);
 });

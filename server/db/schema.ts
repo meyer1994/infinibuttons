@@ -19,6 +19,7 @@ export const RMessages = relations(TMessages, () => ({}));
 export const TButtons = sqliteTable('buttons', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull(),
+  emoji: text('emoji'),
   parentId: integer('parent_id').references(() => TButtons.id),
   discoveredBy: text('discovered_by'),
   createdAt: integer('created_at', { mode: 'timestamp' })

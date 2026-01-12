@@ -2,15 +2,17 @@ import {
   conversations,
   type ConversationFlavor
 } from '@grammyjs/conversations';
-import { Menu } from '@grammyjs/menu';
+import { Menu, MenuRange } from '@grammyjs/menu';
 import { eq, isNull } from 'drizzle-orm';
 import { Bot, Context, session, SessionFlavor } from 'grammy';
 import { ignoreOld } from 'grammy-middlewares';
 import type { UserFromGetMe } from 'grammy/types';
 import type { StorageAdapter } from 'grammy/web';
-import { H3Event } from 'h3';
+import {
+  H3Event
+} from 'h3';
 import { TButtons, TMessages } from '../db/schema';
-import { generateElements } from './ai';
+import { ItemGenerator } from './ai';
 import type { useDrizzle } from './drizzle';
 
 
@@ -67,22 +69,24 @@ async function getOrGenerateButtons(
     : await db.select().from(TButtons).where(eq(TButtons.parentId, parentId)).all();
 
   // If children exist, return them
-  if (existing.length > 0) {
-    return existing;
-  }
+  if (existing.length > 0) return existing;
 
   // Otherwise, generate new ones
-  const parentName = parentId === null ? 'Root' : 
-    (await db.select().from(TButtons).where(eq(TButtons.id, parentId)).get())?.name || 'Unknown';
-  
+  let parentName: string | undefined = 'Root' 
+  if (parentId !== null) {
+    const parent = await db.select().from(TButtons).where(eq(TButtons.id, parentId)).get();
+    parentName = parent?.name;
+  }
+  parentName = parentName ?? 'Root';
+
   // Generate new elements using LLM
-  const newElementNames = await generateElements(ai, parentName);
+  const generator = new ItemGenerator(ai, db);
+  const items = await generator.generate(parentName);
   
-  // Insert them into the database
-  for (const name of newElementNames) {
+  if (items.length > 0) {
     await db
       .insert(TButtons)
-      .values({ name, parentId, discoveredBy: userId });
+      .values(items.map(item => ({ name: item.name, emoji: item.emoji, parentId, discoveredBy: userId })));
   }
 
   // Query to get the inserted rows
@@ -93,124 +97,129 @@ async function getOrGenerateButtons(
   return inserted;
 }
 
-export const useTelegram = (event: H3Event) => {
-  if (!process.env.NITRO_BOT_TOKEN) throw new Error('BOT_TOKEN is not set');
-  if (!process.env.NITRO_BOT_INFO) throw new Error('BOT_INFO is not set');
+export class TelegramBot {
+  public bot: Bot<MyContext>;
 
-  const bot = new Bot<MyContext>(process.env.NITRO_BOT_TOKEN, {
-    botInfo: JSON.parse(process.env.NITRO_BOT_INFO) as UserFromGetMe,
-  });
+  constructor(private event: H3Event) {
+    const token = process.env.NITRO_BOT_TOKEN;
+    const botInfoStr = process.env.NITRO_BOT_INFO;
 
-  // Menu Discovery A - recursively alternates with Menu Discovery B
-  const menuDiscoveryA = new Menu<MyContext>('discovery-a')
-    .dynamic(async (ctx, range) => {
-      const parentId = ctx.session.currentElementId ?? null;
-      const userId = ctx.from?.id.toString();
-      const children = await getOrGenerateButtons(ctx.ai, ctx.db, parentId, userId);
+    if (!token) throw new Error('BOT_TOKEN is not set');
+    if (!botInfoStr) throw new Error('BOT_INFO is not set');
+
+    this.bot = new Bot<MyContext>(token, {
+      botInfo: JSON.parse(botInfoStr) as UserFromGetMe,
+    });
+
+    this.setupMiddleware();
+    this.setupHandlers();
+  }
+
+  private setupMiddleware() {
+    const { event } = this;
+
+    // ignore old updates
+    this.bot.use(ignoreOld(60));
+
+    // inject ai and db into context
+    this.bot.use(async (ctx, next) => {
+      ctx.ai = event.context.ai;
+      ctx.db = event.context.db;
+      await next();
+    });
+
+    // session management
+    this.bot.use(session({ 
+      prefix: 'session:',
+      storage: new DrizzleAdapter(event.context.db),
+      initial: (): Session => ({ currentElementId: null, history: [] })
+    }));
+
+    // conversations support
+    this.bot.use(conversations({ 
+      storage: {
+        type: 'key',
+        prefix: 'conversation:',
+        adapter: new DrizzleAdapter(event.context.db)
+      }
+    }));
+  }
+
+  private setupHandlers() {
+    const { menuDiscoveryA } = this.setupMenus();
+
+    // Command handlers
+    this.bot.command('start', async (ctx) => {
+      ctx.session.currentElementId = null;
+      ctx.session.history = [];
       
-      let i = 0
-      for (const child of children) {
-        range.submenu(child.name, 'discovery-b', async (ctx) => {
-          ctx.session.history.push(ctx.session.currentElementId ?? null);
-          ctx.session.currentElementId = child.id;
-        });
-        if (++i % 2 === 0) range.row();
-      }
+      const existingRoot = await ctx.db
+        .select()
+        .from(TButtons)
+        .where(isNull(TButtons.parentId))
+        .get();
 
-      if (ctx.session.history.length > 0) {
-        range.row().text('⬅️ Back', async (ctx) => {
-          const prevId = ctx.session.history.pop();
-          ctx.session.currentElementId = prevId ?? null;
-          await ctx.menu.nav('discovery-b');
-        });
-      }
-    })
-    .row()
-    .text('Close', async (ctx) => await ctx.menu.close());
-
-  // Menu Discovery B - recursively alternates with Menu Discovery A
-  const menuDiscoveryB = new Menu<MyContext>('discovery-b')
-    .dynamic(async (ctx, range) => {
-      const parentId = ctx.session.currentElementId ?? null;
-      const userId = ctx.from?.id.toString();
-      const children = await getOrGenerateButtons(ctx.ai, ctx.db, parentId, userId);
+      if (!existingRoot) {
+          await ctx.db.insert(TButtons).values([
+            { name: 'Water', emoji: '💧', parentId: null },
+            { name: 'Fire', emoji: '🔥', parentId: null },
+            { name: 'Air', emoji: '💨', parentId: null },
+            { name: 'Earth', emoji: '🌍', parentId: null },
+          ]);
+        }
       
-      let i = 0
-      for (const child of children) {
-        range.submenu(child.name, 'discovery-a', async (ctx) => {
-          ctx.session.history.push(ctx.session.currentElementId ?? null);
-          ctx.session.currentElementId = child.id;
-        });
-        if (++i % 2 === 0) range.row();
-      }
+      await ctx.reply('Infinite Buttons!', { reply_markup: menuDiscoveryA });
+    });
 
-      if (ctx.session.history.length > 0) {
-        range.row().text('⬅️ Back', async (ctx) => {
-          const prevId = ctx.session.history.pop();
-          ctx.session.currentElementId = prevId ?? null;
-          await ctx.menu.nav('discovery-a');
-        });
-      }
-    })
-    .row()
-    .text('Close', async (ctx) => await ctx.menu.close());
+    // Echo text
+    this.bot.on(':text', async ctx => await ctx.reply(`echo: ${ctx.message?.text}`));
+  }
 
-  // Register menus with each other for recursion
-  menuDiscoveryA.register(menuDiscoveryB);
+  private setupMenus() {
+    // Menu Discovery A - recursively alternates with Menu Discovery B
+    const menuDiscoveryA = new Menu<MyContext>('discovery-a')
+      .dynamic(async (ctx, range) => await this.dynamic(ctx, range, 'discovery-b'))
+      .row()
+      .text('Close', async (ctx) => await ctx.menu.close());
 
-  // ignore
-  bot.use(ignoreOld(60))
+    // Menu Discovery B - recursively alternates with Menu Discovery A
+    const menuDiscoveryB = new Menu<MyContext>('discovery-b')
+      .dynamic(async (ctx, range) => await this.dynamic(ctx, range, 'discovery-a'))
+      .row()
+      .text('Close', async (ctx) => await ctx.menu.close());
 
-  bot.use(async (ctx, next) => {
-    ctx.ai = event.context.ai;
-    ctx.db = event.context.db;
-    await next();
-  });
+    // Register menus with each other for recursion
+    menuDiscoveryA.register(menuDiscoveryB);
+    
+    // Register menus with bot
+    this.bot.use(menuDiscoveryA);
 
-  // session
-  bot.use(session({ 
-    prefix: 'session:',
-    storage: new DrizzleAdapter(event.context.db),
-    initial: (): Session => ({ currentElementId: null, history: [] })
-  }));
+    return { menuDiscoveryA, menuDiscoveryB };
+  }
 
-  // conversations
-  bot.use(conversations({ 
-    storage: {
-      type: 'key',
-      prefix: 'conversation:',
-      adapter: new DrizzleAdapter(event.context.db)
+  private async dynamic(ctx: MyContext, range: MenuRange<MyContext>, nextMenuId: string) {
+    const parentId = ctx.session.currentElementId ?? null;
+    const userId = ctx.from?.id.toString();
+    const children = await getOrGenerateButtons(ctx.ai, ctx.db, parentId, userId);
+    
+    let i = 0
+    for (const child of children) {
+      const name = child.emoji ? `${child.emoji} ${child.name}` : child.name;
+      console.info('Child name:', name);
+
+      range.submenu(name, nextMenuId, async (ctx) => {
+        ctx.session.history.push(ctx.session.currentElementId ?? null);
+        ctx.session.currentElementId = child.id;
+      });
+      if (++i % 2 === 0) range.row();
     }
-  }));
 
-  // register menus
-  bot.use(menuDiscoveryA)
-
-  // command handlers
-  bot.command('start', async (ctx) => {
-    ctx.session.currentElementId = null;
-    ctx.session.history = [];
-    
-    const existingRoot = await ctx.db
-      .select()
-      .from(TButtons)
-      .where(isNull(TButtons.parentId))
-      .get();
-
-    if (!existingRoot) {
-        await ctx.db.insert(TButtons).values([
-          { name: 'Water', parentId: null },
-          { name: 'Fire', parentId: null },
-          { name: 'Air', parentId: null },
-          { name: 'Earth', parentId: null },
-        ]);
-      }
-    
-    await ctx.reply('Infinite Buttons!', { reply_markup: menuDiscoveryA });
-  });
-
-  // echo text
-  bot.on(':text', async ctx => await ctx.reply(`echo: ${ctx.message?.text}`));
-
-  return bot;
-};
+    if (ctx.session.history.length > 0) {
+      range.row().text('⬅️ Back', async (ctx) => {
+        const prevId = ctx.session.history.pop();
+        ctx.session.currentElementId = prevId ?? null;
+        await ctx.menu.nav(nextMenuId);
+      });
+    }
+  }
+}

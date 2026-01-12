@@ -1,0 +1,1 @@
+ALTER TABLE `buttons` ADD `emoji` text;
