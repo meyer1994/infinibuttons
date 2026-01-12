@@ -7,7 +7,6 @@ export default defineConfig(
   eslint.configs.recommended,
   tseslint.configs.strict,
   tseslint.configs.stylistic,
-    tseslint.configs.strict,
     {
       plugins: {
         '@stylistic': stylistic

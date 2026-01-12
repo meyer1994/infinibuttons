@@ -1,6 +1,5 @@
 import {
   conversations,
-  type Conversation,
   type ConversationFlavor
 } from '@grammyjs/conversations';
 import { Menu } from '@grammyjs/menu';
@@ -16,14 +15,14 @@ import type { useDrizzle } from './drizzle';
 
 
 interface Session {
-  machines: Array<{ id: string; name: string }>;
-  selectedMachine?: string;
   currentElementId?: number | null;
   history: Array<number | null>;
 }
 
-type MyContext = Context & SessionFlavor<Session> & ConversationFlavor<Context>;
-type MyConversation = Conversation<MyContext>;
+type MyContext = Context & SessionFlavor<Session> & ConversationFlavor<Context> & {
+  ai: Ai;
+  db: ReturnType<typeof useDrizzle>;
+}
 
 class DrizzleAdapter<T> implements StorageAdapter<T> {
   constructor(private db: ReturnType<typeof useDrizzle>) {}
@@ -57,6 +56,7 @@ class DrizzleAdapter<T> implements StorageAdapter<T> {
 
 
 async function getOrGenerateButtons(
+  ai: Ai,
   db: ReturnType<typeof useDrizzle>,
   parentId: number | null,
   userId: string | undefined
@@ -76,7 +76,7 @@ async function getOrGenerateButtons(
     (await db.select().from(TButtons).where(eq(TButtons.id, parentId)).get())?.name || 'Unknown';
   
   // Generate new elements using LLM
-  const newElementNames = await generateElements(parentName);
+  const newElementNames = await generateElements(ai, parentName);
   
   // Insert them into the database
   for (const name of newElementNames) {
@@ -101,14 +101,12 @@ export const useTelegram = (event: H3Event) => {
     botInfo: JSON.parse(process.env.NITRO_BOT_INFO) as UserFromGetMe,
   });
 
-  const db = event.context.db;
-
   // Menu Discovery A - recursively alternates with Menu Discovery B
   const menuDiscoveryA = new Menu<MyContext>('discovery-a')
     .dynamic(async (ctx, range) => {
       const parentId = ctx.session.currentElementId ?? null;
       const userId = ctx.from?.id.toString();
-      const children = await getOrGenerateButtons(db, parentId, userId);
+      const children = await getOrGenerateButtons(ctx.ai, ctx.db, parentId, userId);
       
       let i = 0
       for (const child of children) {
@@ -123,7 +121,7 @@ export const useTelegram = (event: H3Event) => {
         range.row().text('⬅️ Back', async (ctx) => {
           const prevId = ctx.session.history.pop();
           ctx.session.currentElementId = prevId ?? null;
-          await ctx.menu.back();
+          await ctx.menu.nav('discovery-b');
         });
       }
     })
@@ -135,7 +133,7 @@ export const useTelegram = (event: H3Event) => {
     .dynamic(async (ctx, range) => {
       const parentId = ctx.session.currentElementId ?? null;
       const userId = ctx.from?.id.toString();
-      const children = await getOrGenerateButtons(db, parentId, userId);
+      const children = await getOrGenerateButtons(ctx.ai, ctx.db, parentId, userId);
       
       let i = 0
       for (const child of children) {
@@ -150,7 +148,7 @@ export const useTelegram = (event: H3Event) => {
         range.row().text('⬅️ Back', async (ctx) => {
           const prevId = ctx.session.history.pop();
           ctx.session.currentElementId = prevId ?? null;
-          await ctx.menu.back();
+          await ctx.menu.nav('discovery-a');
         });
       }
     })
@@ -163,10 +161,17 @@ export const useTelegram = (event: H3Event) => {
   // ignore
   bot.use(ignoreOld(60))
 
+  bot.use(async (ctx, next) => {
+    ctx.ai = event.context.ai;
+    ctx.db = event.context.db;
+    await next();
+  });
+
   // session
   bot.use(session({ 
+    prefix: 'session:',
     storage: new DrizzleAdapter(event.context.db),
-    initial: (): Session => ({ machines: [], currentElementId: null, history: [] })
+    initial: (): Session => ({ currentElementId: null, history: [] })
   }));
 
   // conversations
@@ -186,14 +191,14 @@ export const useTelegram = (event: H3Event) => {
     ctx.session.currentElementId = null;
     ctx.session.history = [];
     
-    const existingRoot = await db
+    const existingRoot = await ctx.db
       .select()
       .from(TButtons)
       .where(isNull(TButtons.parentId))
       .get();
 
     if (!existingRoot) {
-        await db.insert(TButtons).values([
+        await ctx.db.insert(TButtons).values([
           { name: 'Water', parentId: null },
           { name: 'Fire', parentId: null },
           { name: 'Air', parentId: null },
