@@ -1,23 +1,25 @@
 import {
   conversations,
-  createConversation,
   type Conversation,
   type ConversationFlavor
 } from '@grammyjs/conversations';
 import { Menu } from '@grammyjs/menu';
-import { eq } from 'drizzle-orm';
+import { eq, isNull } from 'drizzle-orm';
 import { Bot, Context, session, SessionFlavor } from 'grammy';
 import { ignoreOld } from 'grammy-middlewares';
 import type { UserFromGetMe } from 'grammy/types';
 import type { StorageAdapter } from 'grammy/web';
 import { H3Event } from 'h3';
-import { TMessages } from '../db/schema';
+import { TButtons, TMessages } from '../db/schema';
+import { generateElements } from './ai';
 import type { useDrizzle } from './drizzle';
 
 
 interface Session {
   machines: Array<{ id: string; name: string }>;
   selectedMachine?: string;
+  currentElementId?: number | null;
+  history: Array<number | null>;
 }
 
 type MyContext = Context & SessionFlavor<Session> & ConversationFlavor<Context>;
@@ -53,75 +55,42 @@ class DrizzleAdapter<T> implements StorageAdapter<T> {
   }
 }
 
-async function createMachine(conversation: MyConversation, ctx: MyContext) {
-  await ctx.reply('Enter name for new machine:');
+
+async function getOrGenerateButtons(
+  db: ReturnType<typeof useDrizzle>,
+  parentId: number | null,
+  userId: string | undefined
+) {
+  // Get existing children
+  const existing = parentId === null
+    ? await db.select().from(TButtons).where(isNull(TButtons.parentId)).all()
+    : await db.select().from(TButtons).where(eq(TButtons.parentId, parentId)).all();
+
+  // If children exist, return them
+  if (existing.length > 0) {
+    return existing;
+  }
+
+  // Otherwise, generate new ones
+  const parentName = parentId === null ? 'Root' : 
+    (await db.select().from(TButtons).where(eq(TButtons.id, parentId)).get())?.name || 'Unknown';
   
-  const { message } = await conversation.waitFor('message:text');
-  if (!message?.text.trim()) {
-    await ctx.reply('No name provided.');
-    return;
+  // Generate new elements using LLM
+  const newElementNames = await generateElements(parentName);
+  
+  // Insert them into the database
+  for (const name of newElementNames) {
+    await db
+      .insert(TButtons)
+      .values({ name, parentId, discoveredBy: userId });
   }
 
-  const session = await conversation.external(ctx => ctx.session)
-  session.machines.push({ id: Math.random().toString(), name: message.text });
-  await conversation.external(ctx => ctx.session = session);
+  // Query to get the inserted rows
+  const inserted = parentId === null
+    ? await db.select().from(TButtons).where(isNull(TButtons.parentId)).all()
+    : await db.select().from(TButtons).where(eq(TButtons.parentId, parentId)).all();
 
-  await ctx.reply(`Machine "${message.text}" created.`);
-}
-
-async function deleteMachine(conversation: MyConversation, ctx: MyContext) {
-  const session = await conversation.external(ctx => ctx.session)
-
-  if (!session.selectedMachine) {
-    await ctx.reply('No machine selected.');
-    return;
-  }
-
-  session.machines = session.machines.filter(m => m.id !== session.selectedMachine);
-  session.selectedMachine = undefined;
-
-  await conversation.external(ctx => ctx.session = session);
-  await ctx.reply(`Machine "${session.selectedMachine}" deleted.`);
-}
-
-async function editMachineName(conversation: MyConversation, ctx: MyContext) {
-  const session = await conversation.external(ctx => ctx.session)
-
-  if (!session.selectedMachine) {
-    await ctx.reply('No machine selected.');
-    return;
-  }
-
-  const machine = session.machines.find(m => m.id === session.selectedMachine);
-
-  if (!machine) {
-    await ctx.reply('Machine not found.');
-    return;
-  }
-
-  await ctx.reply(`Are you sure you want to delete machine "${machine.name}"? (yes/no)`);
-  const { message } = await conversation.waitFor('message:text');
-
-  if (!message?.text?.trim()) {
-    await ctx.reply('No answer provided.');
-    return;
-  }
-
-  const isNo = ['no', 'n'].includes(message.text.toLowerCase().trim())
-  const isYes = ['yes', 'y'].includes(message.text.toLowerCase().trim())
-
-  if (isNo) {
-    await ctx.reply('Deletion cancelled.');
-    return;
-  }
-
-  if (isYes) {
-    session.machines = session.machines.filter(m => m.id !== session.selectedMachine);
-    session.selectedMachine = undefined;
-    await conversation.external(ctx => ctx.session = session);
-    await ctx.reply(`Machine "${machine.name}" deleted.`);
-    return;
-  }
+  return inserted;
 }
 
 export const useTelegram = (event: H3Event) => {
@@ -132,42 +101,64 @@ export const useTelegram = (event: H3Event) => {
     botInfo: JSON.parse(process.env.NITRO_BOT_INFO) as UserFromGetMe,
   });
 
-  // menu machine detail
-  const menuMachineDetail = new Menu<MyContext>('machine-detail')
-    .text('Edit Name', async ctx => await ctx.conversation.enter('editMachineName'))
-    .row()
-    .text('Delete', async ctx => {
-      await ctx.conversation.enter('deleteMachine');
-      await ctx.menu.back()
-    })
-    .row()
-    .back('Back')
-    .text('Close', async ctx => await ctx.menu.close());
+  const db = event.context.db;
 
-  // menu machines list
-  const menuMachinesList = new Menu<MyContext>('machines-list')
+  // Menu Discovery A - recursively alternates with Menu Discovery B
+  const menuDiscoveryA = new Menu<MyContext>('discovery-a')
     .dynamic(async (ctx, range) => {
-      for (const machine of ctx.session.machines) {
-        range.submenu(machine.name, 'machine-detail', async (ctx) => {
-          ctx.session.selectedMachine = machine.id;
+      const parentId = ctx.session.currentElementId ?? null;
+      const userId = ctx.from?.id.toString();
+      const children = await getOrGenerateButtons(db, parentId, userId);
+      
+      let i = 0
+      for (const child of children) {
+        range.submenu(child.name, 'discovery-b', async (ctx) => {
+          ctx.session.history.push(ctx.session.currentElementId ?? null);
+          ctx.session.currentElementId = child.id;
         });
-        range.row();
+        if (++i % 2 === 0) range.row();
+      }
+
+      if (ctx.session.history.length > 0) {
+        range.row().text('⬅️ Back', async (ctx) => {
+          const prevId = ctx.session.history.pop();
+          ctx.session.currentElementId = prevId ?? null;
+          await ctx.menu.back();
+        });
       }
     })
-    .back('Back')
-    .text('Close', async ctx => await ctx.menu.close());
-
-  // menu start
-  const menuStart = new Menu<MyContext>('start')
-    .submenu('List Machines', 'machines-list')
     .row()
-    .text('Create Machine', async ctx => await ctx.conversation.enter('createMachine'))
-    .row()
-    .text('Close', async ctx => await ctx.menu.close());
+    .text('Close', async (ctx) => await ctx.menu.close());
 
-  // register menus
-  menuMachinesList.register(menuMachineDetail);
-  menuStart.register(menuMachinesList);
+  // Menu Discovery B - recursively alternates with Menu Discovery A
+  const menuDiscoveryB = new Menu<MyContext>('discovery-b')
+    .dynamic(async (ctx, range) => {
+      const parentId = ctx.session.currentElementId ?? null;
+      const userId = ctx.from?.id.toString();
+      const children = await getOrGenerateButtons(db, parentId, userId);
+      
+      let i = 0
+      for (const child of children) {
+        range.submenu(child.name, 'discovery-a', async (ctx) => {
+          ctx.session.history.push(ctx.session.currentElementId ?? null);
+          ctx.session.currentElementId = child.id;
+        });
+        if (++i % 2 === 0) range.row();
+      }
+
+      if (ctx.session.history.length > 0) {
+        range.row().text('⬅️ Back', async (ctx) => {
+          const prevId = ctx.session.history.pop();
+          ctx.session.currentElementId = prevId ?? null;
+          await ctx.menu.back();
+        });
+      }
+    })
+    .row()
+    .text('Close', async (ctx) => await ctx.menu.close());
+
+  // Register menus with each other for recursion
+  menuDiscoveryA.register(menuDiscoveryB);
 
   // ignore
   bot.use(ignoreOld(60))
@@ -175,7 +166,7 @@ export const useTelegram = (event: H3Event) => {
   // session
   bot.use(session({ 
     storage: new DrizzleAdapter(event.context.db),
-    initial: (): Session => ({ machines: [] })
+    initial: (): Session => ({ machines: [], currentElementId: null, history: [] })
   }));
 
   // conversations
@@ -186,16 +177,31 @@ export const useTelegram = (event: H3Event) => {
       adapter: new DrizzleAdapter(event.context.db)
     }
   }));
-  bot.use(createConversation(createMachine));
-  bot.use(createConversation(editMachineName));
-  bot.use(createConversation(deleteMachine));
 
   // register menus
-  bot.use(menuStart)
+  bot.use(menuDiscoveryA)
 
   // command handlers
   bot.command('start', async (ctx) => {
-    await ctx.reply('Machine menu', { reply_markup: menuStart });
+    ctx.session.currentElementId = null;
+    ctx.session.history = [];
+    
+    const existingRoot = await db
+      .select()
+      .from(TButtons)
+      .where(isNull(TButtons.parentId))
+      .get();
+
+    if (!existingRoot) {
+        await db.insert(TButtons).values([
+          { name: 'Water', parentId: null },
+          { name: 'Fire', parentId: null },
+          { name: 'Air', parentId: null },
+          { name: 'Earth', parentId: null },
+        ]);
+      }
+    
+    await ctx.reply('Infinite Buttons!', { reply_markup: menuDiscoveryA });
   });
 
   // echo text
